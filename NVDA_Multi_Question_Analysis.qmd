@@ -1,0 +1,925 @@
+---
+title: "NVIDIA Stock: Predictive Modeling and Market Regime Analysis"
+subtitle: "Five research questions with time-aware validation"
+
+---
+
+# 1. Research design and limitations
+
+This study uses daily NVDA observations. Its five questions are: (1) Can past information predict the next trading day's percentage return? (2) Can it predict whether the next day closes up? (3) Can it predict the next day's absolute percentage return, a proxy for realized movement? (4) Can it predict a next-day drop of at least 3%? (5) Which distinct historical trading regimes can be identified? The last question is descriptive, not predictive.
+
+The data cannot establish causal impacts of company news, earnings, macroeconomic events, or investor sentiment because those variables are absent. Results should not be interpreted as a profitable trading strategy without transaction-cost and walk-forward backtesting. In particular, predicting *absolute daily return* is not the same as forecasting an options-implied volatility measure.
+
+Run from the folder containing `nvda_stock_clean.csv`. Install packages once if needed: `pip install pandas numpy matplotlib seaborn scikit-learn`.
+
+```{python}
+#| label: setup
+import warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier, ExtraTreesRegressor, ExtraTreesClassifier, HistGradientBoostingRegressor, HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score, roc_auc_score,
+                             average_precision_score, balanced_accuracy_score, f1_score,
+                             precision_score, recall_score, confusion_matrix, RocCurveDisplay,
+                             PrecisionRecallDisplay, silhouette_score)
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+warnings.filterwarnings('ignore', category=FutureWarning)
+RANDOM_STATE = 42
+sns.set_theme(style='whitegrid')
+DATA_PATH = Path('nvda_stock_clean.csv')
+if not DATA_PATH.exists():
+    DATA_PATH = Path('/mnt/data/nvda_stock_clean.csv')
+if not DATA_PATH.exists():
+    raise FileNotFoundError('Place nvda_stock_clean.csv beside this QMD file.')
+raw = pd.read_csv(DATA_PATH, low_memory=False)
+print('Dataset shape:', raw.shape)
+display(raw.head())
+```
+
+# 2. Data audit: text, multiple values, missingness, and integrity
+
+Text fields must not be blindly discarded. We first distinguish dates, identifiers, categories, free text, and cells containing possible multi-valued entries. Any newly discovered multi-valued fields are flagged for manual review rather than silently split or flattened. For this particular dataset, the expected nonnumeric columns are `date`, `ticker`, and `day_of_week`.
+
+```{python}
+#| label: text-audit
+text_cols = raw.select_dtypes(include=['object', 'string']).columns.tolist()
+text_report = []
+for col in text_cols:
+    s = raw[col].dropna().astype(str)
+    text_report.append({'column': col, 'non_null': len(s), 'unique': s.nunique(),
+                        'mean_length': round(s.str.len().mean(), 2),
+                        'max_length': int(s.str.len().max()),
+                        'possible_multi_value_cells': int(s.str.contains(r'[;|\n]|,\s+', regex=True).sum()),
+                        'example': s.iloc[0] if len(s) else ''})
+display(pd.DataFrame(text_report))
+print('Missing values:')
+display(raw.isna().sum().to_frame('missing_count'))
+print('Duplicate full rows:', raw.duplicated().sum())
+print('Duplicate dates:', raw['date'].duplicated().sum())
+for col in text_cols:
+    if col not in ['date', 'ticker', 'day_of_week']:
+        print('REVIEW NEW TEXT FIELD:', col, raw[col].dropna().astype(str).head(5).tolist())
+```
+
+**Text-handling rule.** Parse `date` chronologically, retain `day_of_week` as a categorical predictor, and exclude the constant ticker identifier from modeling. Do not use TF-IDF or multi-label encoding unless genuine free-text or multi-valued fields are found. If future data include a cell with several tags, split only after confirming its delimiter and meaning; multi-hot encoding preserves separate tags, while TF-IDF is appropriate for substantive natural-language content. Avoid treating an ordinary comma in a sentence as a reliable list separator.
+
+```{python}
+#| label: clean-and-validate
+required = ['date', 'ticker', 'open', 'high', 'low', 'close', 'volume',
+            'daily_return_pct', 'intraday_return_pct', 'daily_range_pct',
+            'overnight_gap_pct', 'volatility_20_pct', 'drawdown_pct', 'day_of_week']
+missing_required = sorted(set(required) - set(raw.columns))
+if missing_required:
+    raise ValueError(f'Missing required columns: {missing_required}')
+df = raw.copy()
+df['date'] = pd.to_datetime(df['date'], errors='coerce')
+if df['date'].isna().any():
+    raise ValueError('Unparseable dates require review.')
+df = df.sort_values('date').reset_index(drop=True)
+if df['date'].duplicated().any():
+    raise ValueError('Duplicate trading dates: resolve before time-series modeling.')
+if df['ticker'].nunique(dropna=False) != 1:
+    raise ValueError('This notebook assumes one ticker; adapt for multi-asset panels.')
+num_cols = df.select_dtypes(include='number').columns
+for col in num_cols:
+    df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+if (df[['open', 'high', 'low', 'close']] <= 0).any().any():
+    raise ValueError('Nonpositive prices require investigation.')
+if (df['volume'] < 0).any():
+    raise ValueError('Negative volume requires investigation.')
+print('Date range:', df.date.min().date(), 'to', df.date.max().date())
+print('Unique ticker:', df.ticker.unique())
+```
+
+# 3. Exploratory data analysis
+
+Plots answer concrete questions: price evolution, distribution of returns, volatility clustering, and potential weekday effects. These are descriptive and cannot establish causal relationships.
+
+```{python}
+#| label: eda
+fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+axes[0, 0].plot(df['date'], df['close'], linewidth=1)
+axes[0, 0].set(title='NVDA closing price over time', ylabel='Price (dataset units)')
+sns.histplot(df['daily_return_pct'].dropna(), bins=90, ax=axes[0, 1])
+axes[0, 1].set(title='Distribution of daily returns', xlabel='Daily return (%)')
+axes[0, 1].set_xlim(-20, 20)
+axes[1, 0].plot(df['date'], df['volatility_20_pct'], linewidth=0.8)
+axes[1, 0].set(title='Rolling 20-day volatility', ylabel='Annualized volatility (%)')
+order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+sns.boxplot(data=df, x='day_of_week', y='daily_return_pct', order=order,
+            showfliers=False, ax=axes[1, 1])
+axes[1, 1].set(title='Daily returns by weekday (outliers hidden)', xlabel='Weekday', ylabel='Return (%)')
+plt.tight_layout(); plt.show()
+print('Return summary:')
+display(df['daily_return_pct'].describe().to_frame('value'))
+```
+
+
+# Exploratory Data Analysis
+The historical closing price of NVIDIA exhibits substantial long-term growth, particularly after 2020, alongside pronounced fluctuations during recent years. This suggests that the stock has experienced different market regimes and highlights the importance of using returns rather than raw prices for short-term predictive modeling.
+
+Daily returns are concentrated around zero, with a mean of 0.194% and a standard deviation of 3.727%. However, the distribution contains substantial extreme observations, ranging from −35.234% to 42.415%. These observations suggest potentially heavy-tailed behavior and support evaluating regression models using both MAE and RMSE.
+
+The 20-day rolling volatility series exhibits considerable variation over time, with pronounced spikes during several historical periods. This pattern is consistent with volatility clustering and supports investigating whether historical volatility and other lagged market indicators can predict future price fluctuations.
+
+Finally, weekday return distributions appear broadly similar, providing limited visual evidence of a strong day-of-week effect. Further statistical testing and feature importance analysis are necessary to determine whether weekday information contributes meaningful predictive value.
+
+Overall, these findings motivate a combination of regression, classification, and clustering approaches to investigate NVIDIA's returns, directional movements, downside risks, and market regimes.
+
+
+
+
+# 4. Leakage-safe feature engineering and chronological validation
+
+Each feature at date *t* uses information observable by the close of date *t*. Targets refer to date *t+1*. Thus predictions are assumed to be made after the current close, not before it. We do **not** include future prices, future returns, or the next day's realized volatility as predictors. Lagged rolling features use historical data only. The last row has no next-day label and is excluded. The training, validation, and test sets follow calendar order. The test set is held out from model selection; a time-series cross-validation on the development period chooses the model. Some reported dataset indicators (e.g., drawdown) are treated as historical features, not targets.
+
+```{python}
+#| label: feature-engineering
+model_df = df.copy()
+model_df['log_volume'] = np.log1p(model_df['volume'])
+model_df['close_to_sma20_pct'] = 100 * (model_df['close'] / model_df['sma_20'] - 1)
+model_df['close_to_sma50_pct'] = 100 * (model_df['close'] / model_df['sma_50'] - 1)
+for lag in [1, 2, 5, 10]:
+    model_df[f'return_lag_{lag}'] = model_df['daily_return_pct'].shift(lag)
+for window in [5, 10, 20]:
+    model_df[f'return_mean_{window}'] = model_df['daily_return_pct'].rolling(window).mean()
+    model_df[f'abs_return_mean_{window}'] = model_df['daily_return_pct'].abs().rolling(window).mean()
+model_df['next_return'] = model_df['daily_return_pct'].shift(-1)
+model_df['next_up'] = (model_df['next_return'] > 0).astype(float)
+model_df['next_abs_return'] = model_df['next_return'].abs()
+model_df['next_large_drop'] = (model_df['next_return'] <= -3).astype(float)
+features = ['daily_return_pct', 'intraday_return_pct', 'daily_range_pct',
+            'overnight_gap_pct', 'volatility_20_pct', 'drawdown_pct', 'log_volume',
+            'close_to_sma20_pct', 'close_to_sma50_pct', 'day_of_week',
+            'return_lag_1', 'return_lag_2', 'return_lag_5', 'return_lag_10',
+            'return_mean_5', 'return_mean_10', 'return_mean_20',
+            'abs_return_mean_5', 'abs_return_mean_10', 'abs_return_mean_20']
+model_df = model_df.loc[model_df['next_return'].notna()].reset_index(drop=True)
+cutoff = int(len(model_df) * 0.80)
+# A one-row label embargo ensures training labels do not refer to the first test date.
+dev = model_df.iloc[:cutoff-1].copy()
+test = model_df.iloc[cutoff:].copy()
+print('Development period:', dev.date.min().date(), '-', dev.date.max().date(), len(dev))
+print('Test period:', test.date.min().date(), '-', test.date.max().date(), len(test))
+print('Features:', features)
+```
+
+# 5. Modeling framework and evaluation standards
+
+Four substantive model families are compared for each supervised question: linear (Ridge or logistic regression), random forest, extremely randomized trees, and histogram gradient boosting. A Dummy baseline provides a reference but is never used for diagnostic plots or feature importance. All preprocessing is fitted **inside** each training fold. Numeric missing values are median-imputed and scaled; weekday is one-hot encoded. This avoids global fitting leakage.
+
+For regression, **MAE** is the primary selection metric because stock returns have extreme observations; RMSE and R² are supplementary. For up/down classification, **ROC-AUC** is primary because it evaluates ranking across thresholds; balanced accuracy and PR-AUC provide additional context. For rare large drops, **PR-AUC** is primary because positive-event prevalence is low; ROC-AUC, recall, precision, and balanced accuracy are secondary. Classification uses a fixed 0.5 probability threshold for supplementary threshold-dependent metrics; threshold optimization would require a separate validation procedure.
+
+```{python}
+#| label: modeling-utilities
+numeric_features = [c for c in features if c != 'day_of_week']
+preprocessor = ColumnTransformer([
+    ('numeric', Pipeline([('imputer', SimpleImputer(strategy='median')),
+                          ('scale', StandardScaler())]), numeric_features),
+    ('weekday', OneHotEncoder(handle_unknown='ignore', sparse_output=False), ['day_of_week'])
+], sparse_threshold=0)
+
+def candidates(task):
+    if task == 'regression':
+        models = {
+            'Ridge': Ridge(alpha=10),
+            'Random Forest': RandomForestRegressor(n_estimators=160, min_samples_leaf=8, n_jobs=-1, random_state=RANDOM_STATE),
+            'Extra Trees': ExtraTreesRegressor(n_estimators=160, min_samples_leaf=8, n_jobs=-1, random_state=RANDOM_STATE),
+            'Hist Gradient Boosting': HistGradientBoostingRegressor(max_iter=130, max_leaf_nodes=15, l2_regularization=2, random_state=RANDOM_STATE),
+            'Dummy Median': DummyRegressor(strategy='median')}
+    else:
+        models = {
+            'Logistic Regression': LogisticRegression(max_iter=1500, random_state=RANDOM_STATE),
+            'Random Forest': RandomForestClassifier(n_estimators=160, min_samples_leaf=8, n_jobs=-1, random_state=RANDOM_STATE),
+            'Extra Trees': ExtraTreesClassifier(n_estimators=160, min_samples_leaf=8, n_jobs=-1, random_state=RANDOM_STATE),
+            'Hist Gradient Boosting': HistGradientBoostingClassifier(max_iter=130, max_leaf_nodes=15, l2_regularization=2, random_state=RANDOM_STATE),
+            'Dummy Prior': DummyClassifier(strategy='prior')}
+    return {name: Pipeline([('preprocess', clone(preprocessor)), ('model', m)]) for name, m in models.items()}
+
+def score_values(y_true, pred, task, proba=None):
+    if task == 'regression':
+        return {'MAE': mean_absolute_error(y_true, pred),
+                'RMSE': np.sqrt(mean_squared_error(y_true, pred)),
+                'R2': r2_score(y_true, pred)}
+    out = {'Balanced Accuracy': balanced_accuracy_score(y_true, pred),
+           'Precision': precision_score(y_true, pred, zero_division=0),
+           'Recall': recall_score(y_true, pred, zero_division=0),
+           'F1': f1_score(y_true, pred, zero_division=0)}
+    out['ROC-AUC'] = roc_auc_score(y_true, proba) if len(np.unique(y_true)) == 2 else np.nan
+    out['PR-AUC'] = average_precision_score(y_true, proba) if len(np.unique(y_true)) == 2 else np.nan
+    return out
+
+def run_question(question, target, task, primary):
+    Xdev, Xtest = dev[features], test[features]
+    ydev, ytest = dev[target].astype(float), test[target].astype(float)
+    if task == 'classification':
+        print('Positive prevalence (development/test):', round(ydev.mean(), 4), round(ytest.mean(), 4))
+    # The gap prevents the final training target from reaching into validation features.
+    cv = TimeSeriesSplit(n_splits=4, gap=1)
+    records = []
+    for name, pipe in candidates(task).items():
+        fold_scores = []
+        for tr, va in cv.split(Xdev):
+            yt, yv = ydev.iloc[tr], ydev.iloc[va]
+            if task == 'classification' and (yt.nunique() < 2 or yv.nunique() < 2):
+                continue
+            m = clone(pipe).fit(Xdev.iloc[tr], yt)
+            p = m.predict(Xdev.iloc[va])
+            prob = m.predict_proba(Xdev.iloc[va])[:, 1] if task == 'classification' else None
+            fold_scores.append(score_values(yv, p, task, prob))
+        if not fold_scores:
+            raise ValueError('Insufficient classes in time-series folds; change question or CV design.')
+        scores = pd.DataFrame(fold_scores).mean(numeric_only=True).to_dict()
+        records.append({'Model': name, 'Folds': len(fold_scores), **scores})
+    ranking = pd.DataFrame(records)
+    ascending = task == 'regression'
+    ranking = ranking.sort_values(primary, ascending=ascending).reset_index(drop=True)
+    display(ranking.round(4))
+    # Select only substantive models. Dummy remains a baseline, never a selected predictor.
+    non_dummy = ranking[~ranking.Model.str.startswith('Dummy')]
+    best_name = non_dummy.iloc[0]['Model']
+    best = candidates(task)[best_name].fit(Xdev, ydev)
+    pred = best.predict(Xtest)
+    prob = best.predict_proba(Xtest)[:, 1] if task == 'classification' else None
+    test_scores = score_values(ytest, pred, task, prob)
+    dummy_name = 'Dummy Median' if task == 'regression' else 'Dummy Prior'
+    baseline = candidates(task)[dummy_name].fit(Xdev, ydev)
+    bp = baseline.predict(Xtest)
+    bprob = baseline.predict_proba(Xtest)[:, 1] if task == 'classification' else None
+    baseline_scores = score_values(ytest, bp, task, bprob)
+    print('Selected by development CV:', best_name, '| Primary:', primary)
+    display(pd.DataFrame([{'Model': best_name, **test_scores},
+                          {'Model': dummy_name, **baseline_scores}]).set_index('Model').round(4))
+    if task == 'regression':
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(test.date, ytest, alpha=.55, label='Actual')
+        ax.plot(test.date, pred, alpha=.8, label='Prediction')
+        ax.set(title=f'{question}: held-out actual vs predicted', ylabel='Percentage points')
+        ax.legend(); plt.tight_layout(); plt.show()
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.scatter(pred, ytest - pred, alpha=.25, s=12)
+        ax.axhline(0, color='black', linestyle='--')
+        ax.set(title=f'{question}: residual diagnostics', xlabel='Predicted', ylabel='Actual - predicted')
+        plt.tight_layout(); plt.show()
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        RocCurveDisplay.from_predictions(ytest, prob, ax=axes[0], name=best_name)
+        PrecisionRecallDisplay.from_predictions(ytest, prob, ax=axes[1], name=best_name)
+        axes[0].set_title(f'{question}: ROC'); axes[1].set_title(f'{question}: precision-recall')
+        plt.tight_layout(); plt.show()
+        print('Confusion matrix at probability threshold 0.5:')
+        display(pd.DataFrame(confusion_matrix(ytest, pred, labels=[0, 1]),
+                             index=['Actual 0', 'Actual 1'], columns=['Predicted 0', 'Predicted 1']))
+    # Holdout permutation importance is descriptive, not used to choose the model.
+    # It operates on original columns, preserving categorical feature meaning.
+    imp = permutation_importance(best, Xtest, ytest, n_repeats=5,
+                                 scoring=('neg_mean_absolute_error' if task == 'regression' else
+                                          ('average_precision' if primary == 'PR-AUC' else 'roc_auc')),
+                                 random_state=RANDOM_STATE, n_jobs=1)
+    importance = pd.DataFrame({'feature': features, 'importance': imp.importances_mean,
+                               'std': imp.importances_std}).sort_values('importance', ascending=False)
+    display(importance.head(12).round(5))
+    top = importance.head(12).sort_values('importance')
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.barh(top.feature, top.importance, xerr=top['std'])
+    ax.set(title=f'{question}: permutation importance ({best_name})', xlabel='Mean drop in evaluation score')
+    plt.tight_layout(); plt.show()
+    print('Interpretation: permutation importance reflects predictive reliance, not causality; correlated features can share importance.')
+    return {'model': best, 'name': best_name, 'cv': ranking, 'test': test_scores,
+            'baseline_test': baseline_scores, 'importance': importance}
+```
+
+# 6. RQ1 — Can past market information predict next-day returns?
+
+**Target:** next-day percentage return. **Primary metric:** MAE. RMSE highlights large mistakes; R² tests whether predictions beat a mean-based variance benchmark. A low MAE alone does not imply a tradable signal.
+
+```{python}
+#| label: rq1
+rq1 = run_question('RQ1 Next-day return', 'next_return', 'regression', 'MAE')
+```
+
+
+# RQ1: Can historical trading indicators predict NVIDIA's next-day stock returns?
+
+Four predictive models—Ridge Regression, Extra Trees, Random Forest, and Histogram Gradient Boosting—were evaluated against a Dummy Median baseline using four-fold time-series cross-validation.
+
+Ridge Regression was the strongest non-baseline model, achieving a cross-validation MAE of 2.1083 and RMSE of 2.9999. However, the Dummy Median baseline performed slightly better, with an MAE of 2.0909 and RMSE of 2.9875. All models produced negative R² values, indicating limited out-of-sample explanatory power.
+
+On the hold-out test set, Ridge achieved an MAE of 2.3540, RMSE of 3.2065, and R² of −0.0039. Although its MAE was marginally lower than that of the Dummy Median baseline, the improvement was negligible.
+
+The actual-versus-predicted plot demonstrates that Ridge predictions remained concentrated near zero and failed to capture substantial positive and negative return movements. Residual diagnostics further revealed considerable prediction errors, particularly during extreme market fluctuations.
+
+Permutation importance identified daily return, intraday return, and overnight price gap as the most influential predictors. Nevertheless, their importance should not be interpreted as evidence of strong predictive performance, given the model's weak overall results.
+
+# Conclusion
+The findings suggest that historical trading indicators provide limited predictive power for NVIDIA's next-day returns. Ridge Regression was the best-performing non-baseline model, but it did not consistently outperform the simple median baseline. More complex ensemble models also failed to improve prediction accuracy.
+
+Overall, RQ1 indicates that next-day stock returns remain difficult to predict using the available historical technical indicators, emphasizing the importance of baseline comparisons and out-of-sample validation in financial forecasting.
+
+
+
+
+# 7. RQ2 — Can the next day's direction be predicted?
+
+**Target:** 1 if next-day return is positive, otherwise 0. **Primary metric:** ROC-AUC; balanced accuracy helps detect models that favor one direction. The final 0.5 threshold is illustrative, not tuned for investment returns.
+
+```{python}
+#| label: rq2
+rq2 = run_question('RQ2 Next-day direction', 'next_up', 'classification', 'ROC-AUC')
+```
+
+
+# RQ2: Can historical trading indicators predict NVIDIA's next-day stock direction?
+
+Four classification models—Logistic Regression, Random Forest, Extra Trees, and Histogram Gradient Boosting—were evaluated against a Dummy Prior baseline using four-fold time-series cross-validation.
+
+Histogram Gradient Boosting achieved the highest cross-validation balanced accuracy of 0.5071, narrowly outperforming Extra Trees (0.5069) and the Dummy Prior baseline (0.5000). However, all models demonstrated limited discriminatory ability, with ROC-AUC values close to 0.5.
+
+On the independent test set, Histogram Gradient Boosting achieved a balanced accuracy of 0.5141, precision of 0.5483, recall of 0.5490, F1-score of 0.5486, ROC-AUC of 0.5152, and average precision of 0.5407. These results indicate only marginal improvements over chance-level classification and the test-set positive prevalence of 0.5352.
+
+The confusion matrix showed 310 true negatives, 409 true positives, 337 false positives, and 336 false negatives. The model correctly classified approximately 51.65% of observations, while a simple always-positive strategy would have achieved 53.52% accuracy. This emphasizes the importance of balanced accuracy and threshold-independent metrics rather than relying solely on conventional accuracy.
+
+Permutation importance identified the 10-day lagged return, overnight price gap, 20-day average absolute return, and deviation from the 50-day moving average as the most influential predictors. Nevertheless, the relatively small importance values and weak predictive performance suggest that these variables provide limited practical discriminatory information.
+
+# Conclusion
+
+Histogram Gradient Boosting was the strongest model according to cross-validation balanced accuracy, but its predictive advantage was minimal. Both the ROC and precision–recall analyses indicate that the model struggled to distinguish positive from non-positive trading days.
+
+Overall, RQ2 suggests that NVIDIA's next-day price direction cannot be predicted reliably using the available historical technical indicators. The findings are consistent with RQ1, reinforcing the difficulty of short-term stock forecasting even when the objective is simplified from predicting exact returns to predicting directional movements.
+
+
+
+# 8. RQ3 — Can the magnitude of tomorrow's price movement be predicted?
+
+**Target:** absolute next-day percentage return. **Primary metric:** MAE. This tests predictability of movement size irrespective of direction, contrasting with RQ1 and RQ2. It is not the same as future annualized volatility.
+
+```{python}
+#| label: rq3
+rq3 = run_question('RQ3 Next-day absolute return', 'next_abs_return', 'regression', 'MAE')
+```
+
+
+# RQ3: Can historical trading indicators predict NVIDIA's next-day absolute returns?
+
+Four regression models—Ridge Regression, Extra Trees, Random Forest, and Histogram Gradient Boosting—were evaluated against a Dummy Median baseline using four-fold time-series cross-validation.
+
+Ridge Regression achieved the strongest cross-validation performance, with an MAE of 1.4696, RMSE of 2.0917, and R² of 0.0264. Compared with the Dummy Median baseline, Ridge reduced MAE by approximately 9.03% and RMSE by 7.89%. It was also the only model to achieve a positive cross-validation R².
+
+On the independent hold-out test set, Ridge achieved an MAE of 1.5077, RMSE of 2.1113, and R² of 0.0558. Although the Dummy Median baseline produced a slightly lower MAE of 1.5007, Ridge achieved a substantially lower RMSE and a positive R², suggesting modest improvements in squared-error prediction performance.
+
+The actual-versus-predicted plot indicates that Ridge captured some variation in market volatility conditions but systematically underestimated extreme absolute returns. Residual diagnostics further revealed large positive errors during unusually volatile trading days, highlighting the model's limited ability to anticipate sudden price movements.
+
+Permutation importance identified daily return, the 20-day average absolute return, intraday return, and the 10-day average return as the most influential predictors. In particular, the importance of historical absolute returns is consistent with the concept of volatility clustering, where periods of elevated market fluctuations may be followed by continued volatility.
+
+# Conclusion
+
+Ridge Regression demonstrated modest but meaningful improvements over the baseline in cross-validation and achieved a positive R² on the independent test set. However, its predictive performance remained limited, particularly during extreme market movements.
+
+Overall, RQ3 suggests that the magnitude of NVIDIA's next-day returns is somewhat more predictable than their exact values or directions. Historical volatility-related indicators contain useful information about future price fluctuations, although the resulting predictions remain insufficient for reliably anticipating extreme market events.
+
+
+
+
+# 9. RQ4 — Can a large next-day downside move be detected?
+
+**Target:** 1 when next-day return is at most −3%, otherwise 0. **Primary metric:** PR-AUC, since large negative returns may be rare. Always compare PR-AUC against the positive-class prevalence and inspect recall/precision; accuracy alone is misleading.
+
+```{python}
+#| label: rq4
+rq4 = run_question('RQ4 Next-day large drop', 'next_large_drop', 'classification', 'PR-AUC')
+```
+
+
+# RQ4: Can historical trading indicators predict large next-day declines in NVIDIA's stock price?
+
+Four classification models—Extra Trees, Logistic Regression, Random Forest, and Histogram Gradient Boosting—were evaluated against a Dummy Prior baseline using four-fold time-series cross-validation. Because large price declines represent a minority class, average precision (PR-AUC) was selected as the primary model evaluation criterion.
+
+Extra Trees achieved the highest cross-validation PR-AUC of 0.1598 and ROC-AUC of 0.6208, outperforming the Dummy Prior baseline, which recorded a PR-AUC of 0.1050 and ROC-AUC of 0.5000. However, the model's recall at the default classification threshold was zero, indicating that it failed to identify positive events.
+
+On the independent hold-out test set, Extra Trees achieved a ROC-AUC of 0.6527 and PR-AUC of 0.2106, exceeding the test-set positive prevalence of 0.1307. These findings indicate moderate risk-ranking ability, although the overall precision–recall performance remained limited.
+
+The confusion matrix revealed that all 1,392 test observations were classified as non-large-drop days. Consequently, the model correctly identified 1,210 negative observations but missed all 182 actual large-drop events, resulting in zero recall, zero F1-score, and a balanced accuracy of 0.5000.
+
+This discrepancy highlights the distinction between probability-based ranking performance and threshold-dependent classification performance. Although Extra Trees assigned relatively higher risk scores to some actual large-drop observations, the default probability threshold of 0.5 was unsuitable for identifying these relatively infrequent events.
+
+Permutation importance identified deviations from the 50-day and 20-day moving averages, day of the week, and recent average returns as the most influential predictors. These findings suggest that historical price trends and market conditions may contain information relevant to downside risk, although the importance estimates do not establish causal relationships.
+
+# Conclusion
+
+Extra Trees demonstrated modest ability to distinguish large-drop days from ordinary trading days based on predicted risk scores. However, its failure to identify any positive events at the default threshold substantially limits its usefulness as an operational warning system.
+
+Overall, RQ4 suggests that historical trading indicators contain some information about NVIDIA's downside risk, but the current classification model cannot reliably identify large price declines. Future improvements should prioritize time-series-based threshold optimization, probability calibration, and evaluation of precision–recall trade-offs while preserving an independent hold-out test set.
+
+
+
+
+# 10. RQ5 — What Historical Trading Regimes Exist?
+This unsupervised analysis identifies historical trading regimes using observed daily returns, intraday returns, price ranges, volatility, drawdowns, and trading volume.
+
+The Elbow Method and Silhouette Score are evaluated for k = 2–8. Four clusters are selected as an interpretability-driven specification, allowing the analysis to distinguish different trading environments while maintaining a manageable number of market regimes.
+
+The selection of k = 4 is evaluated against the diagnostic results rather than assumed to be mathematically optimal.
+
+Preprocessing and K-Means clustering are fitted exclusively on the development period. Hold-out observations are subsequently assigned to the learned centroids without refitting the model.
+
+This analysis provides a descriptive classification of historical market conditions rather than a predictive backtest.
+
+```{python}
+
+#| label: clustering-evaluation
+
+cluster_features = [
+    'daily_return_pct',
+    'intraday_return_pct',
+    'daily_range_pct',
+    'volatility_20_pct',
+    'drawdown_pct',
+    'log_volume'
+]
+
+cluster_prep = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scale', StandardScaler())
+])
+
+Zdev = cluster_prep.fit_transform(dev[cluster_features])
+Ztest = cluster_prep.transform(test[cluster_features])
+
+ks = list(range(2, 9))
+inertias = []
+silhouettes = []
+
+rng = np.random.default_rng(RANDOM_STATE)
+
+subset = rng.choice(
+    len(Zdev),
+    size=min(2500, len(Zdev)),
+    replace=False
+)
+
+for k in ks:
+
+    km = KMeans(
+        n_clusters=k,
+        n_init=10,
+        random_state=RANDOM_STATE
+    ).fit(Zdev)
+
+    inertias.append(km.inertia_)
+
+    silhouettes.append(
+        silhouette_score(
+            Zdev[subset],
+            km.predict(Zdev[subset])
+        )
+    )
+
+cluster_scores = pd.DataFrame({
+    'k': ks,
+    'inertia': inertias,
+    'silhouette': silhouettes
+})
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].plot(
+    ks,
+    inertias,
+    marker='o',
+    linewidth=2
+)
+
+axes[0].axvline(
+    4,
+    color='red',
+    linestyle='--',
+    label='Selected k = 4'
+)
+
+axes[0].set(
+    title='Elbow Method: Inertia vs k',
+    xlabel='Number of clusters',
+    ylabel='Inertia'
+)
+
+axes[0].legend()
+
+axes[1].plot(
+    ks,
+    silhouettes,
+    marker='o',
+    linewidth=2
+)
+
+axes[1].axvline(
+    4,
+    color='red',
+    linestyle='--',
+    label='Selected k = 4'
+)
+
+axes[1].set(
+    title='Silhouette Score vs k',
+    xlabel='Number of clusters',
+    ylabel='Silhouette Score'
+)
+
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()
+
+display(cluster_scores.round(4))
+
+
+```
+
+
+```{python}
+#| label: final-four-clusters
+
+cluster_model = KMeans(
+    n_clusters=selected_k,
+    n_init=20,
+    random_state=RANDOM_STATE
+).fit(Zdev)
+
+cluster_dev = dev.copy()
+cluster_test = test.copy()
+
+cluster_dev['cluster'] = cluster_model.labels_
+
+cluster_test['cluster'] = cluster_model.predict(
+    Ztest
+)
+
+profile = cluster_dev.groupby('cluster')[
+    cluster_features
+].mean()
+
+profile.insert(
+    0,
+    'count',
+    cluster_dev.groupby('cluster').size()
+)
+
+profile.insert(
+    1,
+    'percentage',
+    cluster_dev.groupby('cluster').size()
+    / len(cluster_dev) * 100
+)
+
+print('FOUR-CLUSTER PROFILE')
+
+display(profile.round(3))
+
+# Cluster size visualization.
+fig, ax = plt.subplots(figsize=(8, 4))
+
+cluster_counts = (
+    cluster_dev['cluster']
+    .value_counts()
+    .sort_index()
+)
+
+sns.barplot(
+    x=cluster_counts.index.astype(str),
+    y=cluster_counts.values,
+    color='steelblue',
+    ax=ax
+)
+
+ax.set(
+    title='Distribution of Four Trading Regimes',
+    xlabel='Cluster',
+    ylabel='Number of Trading Days'
+)
+
+for i, count in enumerate(cluster_counts.values):
+    ax.text(
+        i,
+        count,
+        str(count),
+        ha='center',
+        va='bottom'
+    )
+
+plt.tight_layout()
+plt.show()
+
+```
+
+
+
+```{python}
+
+#| label: cluster-profile-heatmap
+
+cluster_means = cluster_dev.groupby(
+    'cluster'
+)[cluster_features].mean()
+
+overall_mean = dev[cluster_features].mean()
+
+overall_std = dev[cluster_features].std().replace(
+    0, np.nan
+)
+
+standardized_profile = (
+    cluster_means - overall_mean
+) / overall_std
+
+fig, ax = plt.subplots(figsize=(11, 5))
+
+sns.heatmap(
+    standardized_profile,
+    cmap='coolwarm',
+    center=0,
+    annot=True,
+    fmt='.2f',
+    linewidths=0.5,
+    ax=ax
+)
+
+ax.set(
+    title='Standardized Feature Profiles of Four Trading Regimes',
+    xlabel='Trading Features',
+    ylabel='Cluster'
+)
+
+plt.tight_layout()
+plt.show()
+
+display(standardized_profile.round(3))
+
+```
+
+
+
+```{python}
+
+#| label: cluster-pca
+
+pca = PCA(
+    n_components=2,
+    random_state=RANDOM_STATE
+)
+
+coords = pca.fit_transform(Zdev)
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+scatter = ax.scatter(
+    coords[:, 0],
+    coords[:, 1],
+    c=cluster_model.labels_,
+    s=8,
+    alpha=0.45,
+    cmap='tab10'
+)
+
+ax.set(
+    title='PCA Projection of Four Historical Trading Regimes',
+    xlabel='Principal Component 1',
+    ylabel='Principal Component 2'
+)
+
+fig.colorbar(
+    scatter,
+    ax=ax,
+    label='Cluster'
+)
+
+plt.tight_layout()
+plt.show()
+
+print('PCA EXPLAINED VARIANCE')
+
+print(
+    'PC1:',
+    round(pca.explained_variance_ratio_[0], 4)
+)
+
+print(
+    'PC2:',
+    round(pca.explained_variance_ratio_[1], 4)
+)
+
+print(
+    'Combined:',
+    round(
+        pca.explained_variance_ratio_.sum(),
+        4
+    )
+)
+
+
+```
+
+
+
+```{python}
+
+#| label: cluster-holdout-distribution
+
+dev_counts = (
+    cluster_dev['cluster']
+    .value_counts()
+    .reindex(range(selected_k), fill_value=0)
+)
+
+test_counts = (
+    cluster_test['cluster']
+    .value_counts()
+    .reindex(range(selected_k), fill_value=0)
+)
+
+cluster_distribution = pd.DataFrame({
+    'Development Count': dev_counts,
+    'Test Count': test_counts,
+    'Development %': dev_counts / len(cluster_dev) * 100,
+    'Test %': test_counts / len(cluster_test) * 100
+})
+
+print('DEVELOPMENT VS HOLD-OUT CLUSTER DISTRIBUTION')
+
+display(cluster_distribution.round(2))
+
+plot_distribution = cluster_distribution[
+    ['Development %', 'Test %']
+]
+
+plot_distribution.plot(
+    kind='bar',
+    figsize=(9, 5),
+    width=0.7
+)
+
+plt.title('Trading Regime Distribution: Development vs Test')
+plt.xlabel('Cluster')
+plt.ylabel('Percentage of Trading Days')
+plt.xticks(rotation=0)
+plt.legend(title='Dataset')
+plt.tight_layout()
+plt.show()
+
+
+```
+
+
+
+```{python}
+
+
+#| label: cluster-interpretation
+
+print('FOUR-CLUSTER INTERPRETATION')
+print('=' * 55)
+
+for cluster_id in range(selected_k):
+
+    row = standardized_profile.loc[cluster_id]
+
+    count = int(
+        cluster_counts.loc[cluster_id]
+    )
+
+    percentage = (
+        count / len(cluster_dev) * 100
+    )
+
+    strongest_features = (
+        row.abs()
+        .sort_values(ascending=False)
+        .head(3)
+        .index
+    )
+
+    print(f'\nCLUSTER {cluster_id}')
+    print('-' * 45)
+
+    print(f'Observations: {count}')
+    print(f'Dataset share: {percentage:.2f}%')
+
+    print('Most distinctive features:')
+
+    for feature in strongest_features:
+
+        value = row[feature]
+
+        direction = (
+            'above average'
+            if value > 0
+            else 'below average'
+        )
+
+        print(
+            f'  {feature}: {value:.2f} SD '
+            f'({direction})'
+        )
+
+    volatility = row['volatility_20_pct']
+    volume = row['log_volume']
+    price_range = row['daily_range_pct']
+
+    if volatility > 0.5:
+
+        print(
+            'Interpretation: Relatively high-volatility '
+            'trading environment.'
+        )
+
+    elif volatility < -0.5:
+
+        print(
+            'Interpretation: Relatively low-volatility '
+            'trading environment.'
+        )
+
+    else:
+
+        print(
+            'Interpretation: Moderate volatility '
+            'relative to the development sample.'
+        )
+
+    if volume > 0.5:
+
+        print(
+            'Trading activity: Above-average volume.'
+        )
+
+    elif volume < -0.5:
+
+        print(
+            'Trading activity: Below-average volume.'
+        )
+
+    if price_range > 0.5:
+
+        print(
+            'Price behavior: Relatively wide '
+            'intraday trading ranges.'
+        )
+
+print('\nOVERALL INTERPRETATION')
+print('-' * 45)
+
+print(
+    'The four-cluster solution provides a descriptive '
+    'taxonomy of historical NVIDIA trading conditions. '
+    'Differences between clusters should be interpreted '
+    'using their observed feature profiles rather than '
+    'assuming predefined market regime labels.'
+)
+
+```
+
+
+
+
+# RQ5: What historical trading regimes exist in NVIDIA's stock market data?
+
+K-Means clustering was applied to six standardized trading features, including daily returns, intraday returns, daily price ranges, rolling volatility, drawdowns, and trading volume. Candidate cluster counts from k=2 to k=8 were evaluated using the Elbow Method and Silhouette Score.
+
+The highest silhouette score was obtained at k=2 (0.3336), while k=4 achieved a lower score of 0.2515. Nevertheless, four clusters were retained as an interpretability-driven specification to distinguish a broader range of historical trading conditions. The inertia curve also showed diminishing improvements beyond approximately four clusters.
+
+The four-cluster solution revealed distinct trading profiles:
+- Cluster 0 (14.02%) — High-Volatility Declining Regime: Characterized by strongly negative daily returns, elevated volatility, wide intraday price ranges, and above-average trading volume.
+
+- Cluster 1 (44.12%) — Low-Volatility, Deep-Drawdown Regime: Characterized by relatively stable daily returns and lower volatility, but substantial historical drawdowns.
+- Cluster 2 (32.10%) — Relatively Stable, Near-High Regime: Characterized by modest positive returns, comparatively low volatility, and substantially shallower drawdowns.
+- Cluster 3 (9.76%) — High-Volatility Rising Regime: Characterized by large positive daily returns, wide trading ranges, elevated volatility, and high trading activity.
+
+The standardized feature heatmap supported these distinctions, particularly the contrast between high-volatility rising and declining conditions. The PCA projection showed partial separation between the clusters, although overlap remained, indicating that the four-regime structure was not perfectly separated in the reduced feature space.
+
+The hold-out analysis revealed substantial changes in regime frequencies. Cluster 2 increased from 32.10% of development observations to 78.23% of test observations, while Cluster 1 declined from 44.12% to 9.84%. This suggests that the distribution of observed trading conditions changed considerably between the two periods.
+
+# Conclusion
+
+The four-cluster K-Means solution provides an interpretable taxonomy of NVIDIA's historical trading conditions, distinguishing high-volatility rising and declining periods from relatively stable environments with different drawdown characteristics.
+
+Although k=2 achieved stronger silhouette separation, k=4 offered greater descriptive granularity. The substantial differences between development and hold-out cluster distributions also highlight the importance of considering changing market conditions in financial analysis.
+
+Overall, RQ5 demonstrates that NVIDIA's historical trading activity can be organized into four interpretable regimes, but these clusters represent descriptive patterns rather than reliable predictions of future market behavior.
+
+
+
+
+
+
+
